@@ -7,6 +7,7 @@ Unless required by applicable law or agreed to in writing, software?distributed 
 
 import logging
 from ..base.calendar import BaseExchangeCalendarEvent, BaseExchangeCalendarService, ExchangeEventOrganizer, ExchangeEventResponse
+from ..base.contact import BaseExchangeContactEvent, BaseExchangeContactService, ExchangeEventOrganizer, ExchangeEventResponse
 from ..base.folder import BaseExchangeFolder, BaseExchangeFolderService
 from ..base.soap import ExchangeServiceSOAP
 from ..exceptions import FailedExchangeException, ExchangeStaleChangeKeyException, ExchangeItemNotFoundException, ExchangeInternalServerTransientErrorException, ExchangeIrresolvableConflictException, InvalidEventType
@@ -30,8 +31,8 @@ class Exchange2010Service(ExchangeServiceSOAP):
   def mail(self):
     raise NotImplementedError("Sorry - nothin' here. Feel like adding it? :)")
 
-  def contacts(self):
-    raise NotImplementedError("Sorry - nothin' here. Feel like adding it? :)")
+  def contact(self,id="contacts"):
+    return Exchange2010ContactService(service=self, calendar_id=id)
 
   def folder(self):
     return Exchange2010FolderService(service=self)
@@ -93,7 +94,6 @@ class Exchange2010CalendarService(BaseExchangeCalendarService):
 
   def list_events(self, start=None, end=None, details=False, delegate_for=None):
     return Exchange2010CalendarEventList(service=self.service, calendar_id=self.calendar_id, start=start, end=end, details=details, delegate_for=delegate_for)
-
 
 class Exchange2010CalendarEventList(object):
   """
@@ -706,6 +706,263 @@ class Exchange2010CalendarEvent(BaseExchangeCalendarEvent):
   def _parse_event_conflicts(self, response):
     conflicting_ids = response.xpath(u'//m:Items/t:CalendarItem/t:ConflictingMeetings/t:CalendarItem/t:ItemId', namespaces=soap_request.NAMESPACES)
     return [id_element.get(u"Id") for id_element in conflicting_ids]
+
+
+class Exchange2010ContactService(BaseExchangeContactService):
+
+  def event(self, id=None, **kwargs):
+    return Exchange2010ContactEvent(service=self.service, id=id, **kwargs)
+
+  def get_event(self, id):
+    return Exchange2010ContactEvent(service=self.service, id=id)
+
+  def new_contact(self, **properties):
+    return Exchange2010ContactEvent(service=self.service, calendar_id=self.calendar_id, **properties)
+
+  def list_events(self, start=None, end=None, details=False, delegate_for=None):
+    return Exchange2010ContactEventList(service=self.service, calendar_id=self.calendar_id, start=start, end=end, details=details, delegate_for=delegate_for)
+
+class Exchange2010ContactEventList(object):
+  """
+  Creates & Stores a list of Exchange2010ContactEvent items in the "self.events" variable.
+  """
+
+  def __init__(self, service=None, calendar_id=u'contacts', start=None, end=None, details=False, delegate_for=None):
+    self.service = service
+    self.count = 0
+    self.start = start
+    self.end = end
+    self.events = list()
+    self.event_ids = list()
+    self.details = details
+    self.delegate_for = delegate_for
+
+    # This request uses a Calendar-specific query between two dates.
+    body = soap_request.get_calendar_items(format=u'AllProperties', calendar_id=calendar_id, start=self.start, end=self.end, delegate_for=self.delegate_for)
+    response_xml = self.service.send(body)
+    self._parse_response_for_all_events(response_xml)
+
+    # Populate the event ID list, for convenience reasons.
+    for event in self.events:
+      self.event_ids.append(event._id)
+
+    # If we have requested all the details, basically repeat the previous 3 steps,
+    # but instead of start/stop, we have a list of ID fields.
+    if self.details:
+      log.debug(u'Received request for all details, retrieving now!')
+      self.load_all_details()
+    return
+
+  def _parse_response_for_all_events(self, response):
+    """
+    This function will retrieve *most* of the event data, excluding Organizer & Attendee details
+    """
+    items = response.xpath(u'//m:FindItemResponseMessage/m:RootFolder/t:Items/t:CalendarItem', namespaces=soap_request.NAMESPACES)
+    if not items:
+      items = response.xpath(u'//m:GetItemResponseMessage/m:Items/t:CalendarItem', namespaces=soap_request.NAMESPACES)
+    if items:
+      self.count = len(items)
+      log.debug(u'Found %s items' % self.count)
+
+      for item in items:
+        self._add_event(xml=soap_request.M.Items(deepcopy(item)))
+    else:
+      log.debug(u'No contact items found with search parameters.')
+
+    return self
+
+  def _add_event(self, xml=None):
+    log.debug(u'Adding new event to all events list.')
+    event = Exchange2010CalendarEvent(service=self.service, xml=xml)
+    log.debug(u'Subject of new event is %s' % event.subject)
+    self.events.append(event)
+    return self
+
+  def load_all_details(self):
+    """
+    This function will execute all the event lookups for known events.
+    This is intended for use when you want to have a completely populated event entry, including
+    Organizer & Attendee details.
+    """
+    log.debug(u"Loading all details")
+    if self.count > 0:
+      # Now, empty out the events to prevent duplicates!
+      del(self.events[:])
+
+      # Send the SOAP request with the list of exchange ID values.
+      log.debug(u"Requesting all event details for events: {event_list}".format(event_list=str(self.event_ids)))
+      body = soap_request.get_item(exchange_id=self.event_ids, format=u'AllProperties')
+      response_xml = self.service.send(body)
+
+      # Re-parse the results for all the details!
+      self._parse_response_for_all_events(response_xml)
+
+    return self
+
+
+class Exchange2010ContactEvent(BaseExchangeContactEvent):
+
+  def _init_from_service(self, id):
+    log.debug(u'Creating new Exchange2010ContactEvent object from ID')
+    body = soap_request.get_item(exchange_id=id, format=u'AllProperties')
+    response_xml = self.service.send(body)
+    properties = self._parse_response_for_get_event(response_xml)
+
+    self._update_properties(properties)
+    self._id = id
+    log.debug(u'Created new event object with ID: %s' % self._id)
+
+    self._reset_dirty_attributes()
+
+    return self
+
+  def _init_from_xml(self, xml=None):
+    log.debug(u'Creating new Exchange2010ContactEvent object from XML')
+
+    properties = self._parse_response_for_get_event(xml)
+    self._update_properties(properties)
+    self._id, self._change_key = self._parse_id_and_change_key_from_response(xml)
+
+    log.debug(u'Created new event object with ID: %s' % self._id)
+    self._reset_dirty_attributes()
+
+    return self
+
+  def as_json(self):
+    raise NotImplementedError
+
+  def validate(self):
+    super(Exchange2010ContactEvent, self).validate()
+
+  def create(self):
+    """
+    Creates a contact in Exchange. ::
+
+        contact = service.contact().new_contact(
+          Name=u"Yenthe",
+          company_name = u"Google",
+        )
+        contact.create()
+
+    """
+    self.validate()
+    body = soap_request.new_contact(self)
+
+    response_xml = self.service.send(body)
+    self._id, self._change_key = self._parse_id_and_change_key_from_response(response_xml)
+
+    return self
+
+  def resend_invitations(self):
+    """
+    Resends invites for an event.  ::
+
+        event = service.calendar().get_event(id='KEY HERE')
+        event.resend_invitations()
+
+    Anybody who has not declined this meeting will get a new invite.
+    """
+
+    if not self.id:
+      raise TypeError(u"You can't send invites for an event that hasn't been created yet.")
+
+    # Under the hood, this is just an .update() but with no attributes changed.
+    # We're going to enforce that by checking if there are any changed attributes and bail if there are
+    if self._dirty_attributes:
+      raise ValueError(u"There are unsaved changes to this invite - please update it first: %r" % self._dirty_attributes)
+
+    self.refresh_change_key()
+    body = soap_request.update_item(self, [], calendar_item_update_operation_type=u'SendOnlyToAll')
+    self.service.send(body)
+
+    return self
+
+  def update(self, calendar_item_update_operation_type=u'SendToAllAndSaveCopy', **kwargs):
+    """
+    Updates a contact in Exchange.  ::
+
+        contact = service.contact().get_contact(id='KEY HERE')
+        contact.name = u'New name'
+        event.update()
+
+    If no changes to the event have been made, this method does nothing.
+
+    Notification of the change event is sent to all users. If you wish to just notify people who were
+    added, specify ``send_only_to_changed_attendees=True``.
+    """
+    if not self.id:
+      raise TypeError(u"You can't update an event that hasn't been created yet.")
+
+    if 'send_only_to_changed_attendees' in kwargs:
+      warnings.warn(
+        "The argument send_only_to_changed_attendees is deprecated.  Use calendar_item_update_operation_type instead.",
+        DeprecationWarning,
+      )  # 20140502
+      if kwargs['send_only_to_changed_attendees']:
+        calendar_item_update_operation_type = u'SendToChangedAndSaveCopy'
+
+    VALID_UPDATE_OPERATION_TYPES = (
+      u'SendToNone', u'SendOnlyToAll', u'SendOnlyToChanged',
+      u'SendToAllAndSaveCopy', u'SendToChangedAndSaveCopy',
+    )
+    if calendar_item_update_operation_type not in VALID_UPDATE_OPERATION_TYPES:
+      raise ValueError('calendar_item_update_operation_type has unknown value')
+
+    self.validate()
+
+    if self._dirty_attributes:
+      log.debug(u"Updating these attributes: %r" % self._dirty_attributes)
+      self.refresh_change_key()
+
+      body = soap_request.update_item(self, self._dirty_attributes, calendar_item_update_operation_type=calendar_item_update_operation_type)
+      self.service.send(body)
+      self._reset_dirty_attributes()
+    else:
+      log.info(u"Update was called, but there's nothing to update. Doing nothing.")
+
+    return self
+
+  def cancel(self):
+    """
+    Removes a contact in Exchange.  ::
+
+        contact = service.contact().get_event(id='KEY HERE')
+        contact.cancel()
+
+    """
+    if not self.id:
+      raise TypeError(u"You can't delete a contact that hasn't been created yet.")
+
+    self.refresh_change_key()
+    self.service.send(soap_request.delete_event(self))
+    # TODO rsanders high - check return status to make sure it was actually sent
+    return None
+
+  def get_master(self):
+    """
+      get_master()
+      :raises InvalidEventType: When this method is called on an event that is not a Occurrence type.
+
+      This will return the master event to the occurrence.
+
+      **Examples**::
+
+        event = service.calendar().get_event(id='<event_id>')
+        print event.type  # If it prints out 'Occurrence' then that means we could get the master.
+
+        master = event.get_master()
+        print master.type  # Will print out 'RecurringMaster'.
+
+
+    """
+
+    if self.type != 'Occurrence':
+      raise InvalidEventType("get_master method can only be called on a 'Occurrence' event type")
+
+    body = soap_request.get_master(exchange_id=self._id, format=u"AllProperties")
+    response_xml = self.service.send(body)
+
+    return Exchange2010ContactEvent(service=self.service, xml=response_xml)
 
 
 class Exchange2010FolderService(BaseExchangeFolderService):
